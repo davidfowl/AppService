@@ -1,0 +1,462 @@
+<?xml version="1.0" encoding="utf-8"?><feed xmlns="http://www.w3.org/2005/Atom" xml:lang="en_US"><generator uri="https://jekyllrb.com/" version="3.8.6">Jekyll</generator><link href="https://azure.github.io/AppService/feed.xml" rel="self" type="application/atom+xml" /><link href="https://azure.github.io/AppService/" rel="alternate" type="text/html" hreflang="en_US" /><updated>2022-08-19T00:12:31+00:00</updated><id>https://azure.github.io/AppService/feed.xml</id><title type="html">Azure App Service</title><subtitle>Announcements, updates, and release notes from the Azure App Service product team.</subtitle><author><name>Azure App Service</name></author><entry><title type="html">A Heavy Lift: Bringing Kestrel + YARP to Azure App Services</title><link href="https://azure.github.io/AppService/2022/08/16/A-Heavy-Lift.html" rel="alternate" type="text/html" title="A Heavy Lift: Bringing Kestrel + YARP to Azure App Services" /><published>2022-08-16T00:00:00+00:00</published><updated>2022-08-16T00:00:00+00:00</updated><id>https://azure.github.io/AppService/2022/08/16/A-Heavy-Lift</id><content type="html" xml:base="https://azure.github.io/AppService/2022/08/16/A-Heavy-Lift.html">&lt;p&gt;In this post, we get a behind-the-scenes look at the engineering work required to change a critical platform component with code paths that are exercised billions of times a day while minimizing service disruptions and maintaining SLA for our customers. We provide a brief introduction to help cover the basics, go over motivations for doing this work, explain some of the more interesting challenges, issues, and bugs encountered along the way, and close with the results and the new customers scenarios enabled.&lt;/p&gt;
+
+&lt;p&gt;The challenge was huge, but we’re excited about the benefits this brings to Azure App Services and our customers:&lt;/p&gt;
+
+&lt;ul&gt;
+  &lt;li&gt;Almost 80% improvement in throughput in performance tests designed to isolate the benefits.&lt;/li&gt;
+  &lt;li&gt;Greener Azure data centers from significantly decreased per-request CPU usage.&lt;/li&gt;
+  &lt;li&gt;Support for modern protocols like HTTP/3.&lt;/li&gt;
+  &lt;li&gt;Support for new customer scenarios such as gRPC applications, per-host cipher suite configuration, custom error pages, and more.&lt;/li&gt;
+&lt;/ul&gt;
+
+&lt;h2 id=&quot;introduction&quot;&gt;Introduction&lt;/h2&gt;
+
+&lt;p&gt;In 2021, a group of engineers across multiple teams, including .NET and Azure, got together to transition the &lt;strong&gt;App Service Frontend&lt;/strong&gt; fleet to &lt;strong&gt;Kestrel + &lt;a href=&quot;https://github.com/microsoft/reverse-proxy&quot;&gt;YARP&lt;/a&gt;&lt;/strong&gt;. As we celebrate the completion of this major lift and collaboration, we decided to write down the journey and describe some of the challenges of completing such a change to a live service, the wins we achieved, and the future work enabled by this transition. We hope you enjoy it.&lt;/p&gt;
+
+&lt;h3 id=&quot;azure-app-service-in-a-nutshell&quot;&gt;Azure App Service in a nutshell&lt;/h3&gt;
+
+&lt;p&gt;Azure App Service recently celebrated its 10 year anniversary (we launched it on June 7th, 2012).  We are grateful and humbled by our customers who have helped us grow into a big service (affectionately called an XXL service in Azure internally, a designation only shared with 3 other services). Here are some numbers that provide a glimpse into our scale:&lt;/p&gt;
+
+&lt;ul&gt;
+  &lt;li&gt;160B+ daily HTTP requests served by applications&lt;/li&gt;
+  &lt;li&gt;14M+ host names&lt;/li&gt;
+  &lt;li&gt;1.5K+ multi-tenant scale units and an additional 10K+ dedicated scale units (App Service Environments aka App Service Isolated SKU)&lt;/li&gt;
+&lt;/ul&gt;
+
+&lt;p&gt;One of the key architectural pieces of this system is our &lt;strong&gt;FrontEndRole&lt;/strong&gt;. The &lt;strong&gt;FrontEndRole&lt;/strong&gt; main purposes are:&lt;/p&gt;
+
+&lt;ul&gt;
+  &lt;li&gt;Receiving traffic on HTTP/HTTPS from public virtual IP addresses associated with a scale unit&lt;/li&gt;
+  &lt;li&gt;Terminating SSL if required&lt;/li&gt;
+  &lt;li&gt;Determining which set of VMs are the origin-servers for the application (called Workers) and then routing to them&lt;/li&gt;
+&lt;/ul&gt;
+
+&lt;p&gt;&lt;img src=&quot;/AppService/media/2022/08/FE_Diagram.jpg&quot; alt=&quot;FrontEndRole diagram&quot; /&gt;&lt;/p&gt;
+
+&lt;p&gt;App Service was originally built as a Cloud Service and this role is just called FrontEndRole. With our transition to VM Scale Sets, the FrontEndRole is a separate scale set which is part of each scale unit.&lt;/p&gt;
+
+&lt;p&gt;The original App Service FrontEndRole, which runs on Windows Server, consisted of:&lt;/p&gt;
+
+&lt;ul&gt;
+  &lt;li&gt;IIS running on HTTP.sys, both operating system components of Windows Server&lt;/li&gt;
+  &lt;li&gt;&lt;a href=&quot;https://www.iis.net/downloads/microsoft/application-request-routing&quot;&gt;Application Request Routing (ARR)&lt;/a&gt;, which does request forwarding using WinHTTP&lt;/li&gt;
+&lt;/ul&gt;
+
+&lt;h3 id=&quot;kestrel-and-yarp-in-a-nutshell&quot;&gt;Kestrel and YARP in a nutshell&lt;/h3&gt;
+
+&lt;p&gt;The first release of .NET Core introduced the &lt;strong&gt;Kestrel webserver&lt;/strong&gt;: an open-source, cross-platform, and fast webserver implementation built using modern .NET. Performance is a key focus for the .NET team, and with each .NET release, &lt;strong&gt;Kestrel&lt;/strong&gt; has gotten ever faster and more full-featured. As an example, recent changes made to &lt;strong&gt;Kestrel&lt;/strong&gt; include:&lt;/p&gt;
+
+&lt;ul&gt;
+  &lt;li&gt;Significant scalability improvements on many-core machines&lt;/li&gt;
+  &lt;li&gt;Significant HTTP/2 performance enhancements when running with many concurrent streams&lt;/li&gt;
+  &lt;li&gt;Support for new standards like HTTP/3&lt;/li&gt;
+&lt;/ul&gt;
+
+&lt;p&gt;&lt;strong&gt;YARP (“Yet Another Reverse Proxy”)&lt;/strong&gt; is a reverse proxy toolkit that enables building fast proxy servers using infrastructure from ASP.NET and .NET, focusing on easy customization. It is developed in the open at &lt;a href=&quot;https://github.com/microsoft/reverse-proxy&quot;&gt;https://github.com/microsoft/reverse-proxy&lt;/a&gt;. YARP’s toolkit/extensibility model made it easy for us to incorporate our routing and TLS handling with its request forwarding capabilities. &lt;strong&gt;YARP&lt;/strong&gt; includes support for modern protocols like HTTP/2 &amp;amp; HTTP/3, which App Service customers can now expose.
+In addition, being based on the fast-evolving .NET platform means that every release, &lt;strong&gt;Kestrel&lt;/strong&gt; and &lt;strong&gt;YARP&lt;/strong&gt; benefit from improvements up and down the .NET stack, including everything from networking libraries all the way down to JIT compiler improvements that improve the quality of generated code. For a sampling of the types of improvements that went into just the .NET 6 release in 2021, see &lt;a href=&quot;https://devblogs.microsoft.com/dotnet/performance-improvements-in-net-6/#gc&quot;&gt;Performance Improvements in .NET 6&lt;/a&gt;.&lt;/p&gt;
+
+&lt;h2 id=&quot;betting-on-kestrel--yarp-for-app-service-why&quot;&gt;Betting on Kestrel + YARP for App Service: Why?&lt;/h2&gt;
+
+&lt;p&gt;The previous &lt;strong&gt;FrontEndRole&lt;/strong&gt; architecture of App Service built on IIS/HTTP.SYS has served us well, but the promise of a modern HTTP stack in &lt;strong&gt;Kestrel + YARP&lt;/strong&gt; could deliver new benefits to all App Service customers.  Specifically:&lt;/p&gt;
+
+&lt;ul&gt;
+  &lt;li&gt;Performance improvements, including significantly decreased per-request CPU cost and per-connection memory cost.&lt;/li&gt;
+  &lt;li&gt;More flexible extensibility points into SSL termination path, allowing for easier dynamic SNI host selection.&lt;/li&gt;
+  &lt;li&gt;Enable new customer scenarios like support for gRPC, per-host cipher suite configuration, custom error pages, and more.&lt;/li&gt;
+&lt;/ul&gt;
+
+&lt;p&gt;With all that context and motivation, the goal of the V-Team was clear:&lt;/p&gt;
+&lt;blockquote&gt;
+  &lt;p&gt;&lt;strong&gt;“Transition the 200K+ dedicated cores running FrontEndRole to use Kestrel + YARP (and thus move away from IIS/HTTP.SYS/ARR)”&lt;/strong&gt;&lt;/p&gt;
+&lt;/blockquote&gt;
+
+&lt;h2 id=&quot;challenge-server-framework-diversity&quot;&gt;Challenge: Server Framework Diversity&lt;/h2&gt;
+
+&lt;p&gt;App Service is not the first Microsoft service to transition to Kestrel and YARP. Microsoft has already documented the journeys of Bing, Azure Active Directory (AAD), and Dynamics 365 to .NET; these efforts have proven out the stability and performance of .NET for critical service workloads.&lt;/p&gt;
+
+&lt;ul&gt;
+  &lt;li&gt;&lt;a href=&quot;https://devblogs.microsoft.com/dotnet/bing-com-runs-on-net-core-2-1/&quot;&gt;Bing.com runs on .NET Core 2.1!&lt;/a&gt;&lt;/li&gt;
+  &lt;li&gt;&lt;a href=&quot;https://devblogs.microsoft.com/dotnet/azure-active-directorys-gateway-is-on-net-6-0/&quot;&gt;Azure Active Directory’s gateway is on .NET 6.0!&lt;/a&gt;&lt;/li&gt;
+  &lt;li&gt;&lt;a href=&quot;https://youtu.be/67tCWKnweso?t=1803&quot;&gt;Dynamics 365 using YARP&lt;/a&gt;&lt;/li&gt;
+&lt;/ul&gt;
+
+&lt;p&gt;The unique challenge that App Service adds to the mix is the diversity of server implementations.  The previously mentioned Microsoft services are written by server engineers working for … Microsoft.  This is definitely not the case for App Service, which enables customers to &lt;em&gt;bring their own server frameworks&lt;/em&gt; and &lt;em&gt;write their own applications with varying levels of standards compliance&lt;/em&gt;.  Hosting customer applications brings a unique set of challenges described below.&lt;/p&gt;
+
+&lt;h2 id=&quot;challenge-platform-versus-organic-health&quot;&gt;Challenge: Platform versus Organic Health&lt;/h2&gt;
+
+&lt;p&gt;Because App Service enables customers to write their own applications, the concept of &lt;em&gt;“service health”&lt;/em&gt; is a nuanced discussion.  App Service measures the health of the platform; we ensure that customers have a running VM which can connect to storage and can execute a simple canary request.  But App Service cannot easily measure the organic health (HTTP request success rate) since we do not control the application. As a result, we primarily focused on platform health as our main metric.&lt;/p&gt;
+
+&lt;p&gt;For our transition to &lt;strong&gt;Kestrel + YARP&lt;/strong&gt;, we needed to broaden our measurement to include organic health.  Rather than looking for an absolute bar (say &amp;gt;99.99% success), we needed to compare &lt;em&gt;“before Kestrel + YARP”&lt;/em&gt; and &lt;em&gt;“after Kestrel + YARP”&lt;/em&gt; organic success and look for anomalies that would point out potential problems.&lt;/p&gt;
+
+&lt;h2 id=&quot;challenge-quick-rollback-in-production&quot;&gt;Challenge: Quick Rollback in Production&lt;/h2&gt;
+
+&lt;p&gt;With a broadened approach to assessing organic health anomalies caused by a diverse set of applications/frameworks on our platform, we required fast mechanisms to undo our &lt;strong&gt;Kestrel + YARP&lt;/strong&gt; transition on a per scale-unit basis; in other words, we needed to be able to &lt;em&gt;“break glass”&lt;/em&gt; quickly when we encountered problems and return to using IIS/HTTP.SYS.&lt;/p&gt;
+
+&lt;h2 id=&quot;the-journey-100-frontendroles-using-kestrelyarp&quot;&gt;The Journey: 100% FrontEndRoles using Kestrel/YARP&lt;/h2&gt;
+
+&lt;p&gt;With all the context and challenges described, here is how the journey looked like in a picture.&lt;/p&gt;
+
+&lt;p&gt;&lt;img src=&quot;/AppService/media/2022/08/FE_Migration.jpg&quot; alt=&quot;FrontEndRole Migration&quot; /&gt;&lt;/p&gt;
+
+&lt;p&gt;As you can see this journey took a lot of time. 6 months passed between the first Kestrel/YARP deployment and 100%.&lt;/p&gt;
+
+&lt;h2 id=&quot;the-bugs-encountered&quot;&gt;The Bugs Encountered&lt;/h2&gt;
+
+&lt;p&gt;We encountered multiple bugs on our journey to &lt;strong&gt;Kestrel + YARP&lt;/strong&gt;. Apart from bugs in our business logic, one of the interesting classes of issue we encountered was the treatment of edge-cases in the HTTP specification. A diversity of clients hit our &lt;strong&gt;FrontEndRole&lt;/strong&gt;. We need to be generous in accepting behavior that may not be exactly the HTTP spec’s letter and intent.&lt;/p&gt;
+
+&lt;p&gt;A simple example of one of these cases is when a request has leading newline characters (CR and/or LF). Strictly speaking, this isn’t allowed, but it turns out that there are some clients that send requests that start like:&lt;/p&gt;
+
+&lt;pre&gt;&lt;code class=&quot;language-aspx-csharp&quot;&gt;\rGET / HTTP/1.1\r\n
+...
+&lt;/code&gt;&lt;/pre&gt;
+
+&lt;p&gt;This is a case that IIS (and some other servers) allow, but because &lt;strong&gt;Kestrel&lt;/strong&gt; historically has taken a fairly strict stance, we saw its parser rejecting requests like this with a &lt;code class=&quot;highlighter-rouge&quot;&gt;BadHttpRequestException&lt;/code&gt;. Working closely with the ASP.NET Core team, we were able to make &lt;strong&gt;Kestrel&lt;/strong&gt; a bit more generous in what it accepts (the example above now works in &lt;strong&gt;Kestrel&lt;/strong&gt; in .NET 6.0.5 and newer releases).&lt;/p&gt;
+
+&lt;p&gt;Some other &lt;em&gt;interesting&lt;/em&gt; issues uncovered can be found &lt;a href=&quot;https://github.com/dotnet/aspnetcore/pull/40833&quot;&gt;here&lt;/a&gt;, &lt;a href=&quot;https://github.com/dotnet/aspnetcore/pull/40633&quot;&gt;here&lt;/a&gt; and &lt;a href=&quot;https://github.com/microsoft/reverse-proxy/pull/1773&quot;&gt;here&lt;/a&gt;.&lt;/p&gt;
+
+&lt;p&gt;As a result of investigating and addressing this class of issues, not only have we succeeded in a smooth migration, but we’ve also helped make &lt;strong&gt;Kestrel&lt;/strong&gt; a &lt;a href=&quot;https://en.wikipedia.org/wiki/Robustness_principle&quot;&gt;more robust server&lt;/a&gt; by allowing it to deal with nuances in the interpretation of the HTTP spec with no impact to existing clients but also allowing it to better deal with more kinds of &lt;em&gt;“unusual”&lt;/em&gt; traffic.&lt;/p&gt;
+
+&lt;h2 id=&quot;the-payoff-performance-and-new-features-now-and-in-the-future&quot;&gt;The Payoff: Performance and New Features, Now and in the Future&lt;/h2&gt;
+
+&lt;p&gt;Now that we have moved our &lt;strong&gt;FrontEndRoles&lt;/strong&gt; to &lt;strong&gt;Kestrel + YARP&lt;/strong&gt; we have realized multiple benefits in production.&lt;/p&gt;
+
+&lt;p&gt;Performance tests designed to isolate the benefits of our &lt;strong&gt;FrontEndRole&lt;/strong&gt; change showed an &lt;strong&gt;almost 80% improvement in throughput&lt;/strong&gt; (tested using a simple 1K &lt;em&gt;helloworld&lt;/em&gt; response from a single dedicated worker in a test environment).  App Service over-provisions &lt;strong&gt;FrontEndRole&lt;/strong&gt; instances, so the realized benefit across our aggregate fleet is a large decrease in CPU% which provides more CPU headroom for the fleet. We are still in the early days of monitoring the fleet post-move; we may eventually be able to decrease our cores assigned to this role to reduce operating costs and data center energy usage. More investigation to follow.&lt;/p&gt;
+
+&lt;p&gt;With our move to &lt;strong&gt;Kestrel + YARP&lt;/strong&gt;  on our &lt;strong&gt;FrontEndRoles&lt;/strong&gt;, we were also able to move our &lt;strong&gt;Linux worker VMs&lt;/strong&gt; to use &lt;strong&gt;Kestrel+YARP&lt;/strong&gt;. This change allows us to replace nginx, commonize the codebase, and &lt;a href=&quot;https://azure.github.io/AppService/2022/05/23/gRPC-support-on-App-Service.html&quot;&gt;light up gRPC for our App Service Linux SKUs&lt;/a&gt;. gRPC support has been a popular feature request from Azure App Services users and we’re excited to add this capability.&lt;/p&gt;
+
+&lt;p&gt;With this platform work complete we are now working on enabling two of the most frequently requested features in App Service; more news coming soon as we complete these improvements:&lt;/p&gt;
+&lt;ul&gt;
+  &lt;li&gt;Ability to configure custom error pages for requests that terminate on the front end (Specifically: HTTP 503, HTTP 502 and HTTP 403).&lt;/li&gt;
+  &lt;li&gt;Ability to specify TLS cipher suite allowed per given application.  Today customers can only configure allowed cipher suites on our Isolated SKUs.&lt;/li&gt;
+&lt;/ul&gt;
+
+&lt;h2 id=&quot;a-great-partnership&quot;&gt;A Great Partnership&lt;/h2&gt;
+
+&lt;p&gt;Once you have a live multi-tenant service running with millions of VMs globally, you learn to be very careful with how and when you advance it. That said, the innovations with &lt;strong&gt;Kestrel + YARP&lt;/strong&gt; being developed by the .NET core team were just too valuable to pass up. At the same time, the .NET team would tell you the experience of supporting this migration was a whole new challenge for that team as they experienced the breadth and diversity of App Service scenarios. This was a great journey for both teams and we landed it. Now that we have this new platform in place, we look forward to continued innovation between our teams.&lt;/p&gt;</content><author><name>Azure App Service</name></author><summary type="html">In this post, we get a behind-the-scenes look at the engineering work required to change a critical platform component with code paths that are exercised billions of times a day while minimizing service disruptions and maintaining SLA for our customers. We provide a brief introduction to help cover the basics, go over motivations for doing this work, explain some of the more interesting challenges, issues, and bugs encountered along the way, and close with the results and the new customers scenarios enabled.</summary></entry><entry><title type="html">gRPC support on App Service now in Public Preview</title><link href="https://azure.github.io/AppService/2022/08/11/gRPC-support-on-App-Service-now-in-Public-Preview.html" rel="alternate" type="text/html" title="gRPC support on App Service now in Public Preview" /><published>2022-08-11T00:00:00+00:00</published><updated>2022-08-11T00:00:00+00:00</updated><id>https://azure.github.io/AppService/2022/08/11/gRPC-support-on-App-Service-now-in-Public-Preview</id><content type="html" xml:base="https://azure.github.io/AppService/2022/08/11/gRPC-support-on-App-Service-now-in-Public-Preview.html">&lt;p&gt;We are pleased to announce that gRPC (public preview) is now available in &lt;a href=&quot;https://github.com/Azure/app-service-linux-docs/tree/master/HowTo/gRPC&quot;&gt;most regions&lt;/a&gt;.  gRPC is supported for Linux applications using .NET Core 3.1 or .NET 6.  Node support is coming soon (9/1/22).&lt;/p&gt;
+
+&lt;p&gt;Please visit this tutorial &lt;a href=&quot;https://github.com/Azure/app-service-linux-docs/blob/master/HowTo/gRPC/use_gRPC_with_dotnet.md#how-to-deploy-a-net-6-grpc-app-on-app-service&quot;&gt;How-To deploy a .NET 6 gRPC app on App Service&lt;/a&gt; to try out gRPC on App Service today.&lt;/p&gt;</content><author><name>Azure App Service</name></author><summary type="html">We are pleased to announce that gRPC (public preview) is now available in most regions. gRPC is supported for Linux applications using .NET Core 3.1 or .NET 6. Node support is coming soon (9/1/22).</summary></entry><entry><title type="html">Announcing GA: WordPress on Azure App Service</title><link href="https://azure.github.io/AppService/2022/08/08/Announcing-GA-WordPress-on-Azure-App-Service.html" rel="alternate" type="text/html" title="Announcing GA: WordPress on Azure App Service" /><published>2022-08-08T00:00:00+00:00</published><updated>2022-08-08T00:00:00+00:00</updated><id>https://azure.github.io/AppService/2022/08/08/Announcing%20GA%20WordPress%20on%20Azure%20App%20Service</id><content type="html" xml:base="https://azure.github.io/AppService/2022/08/08/Announcing-GA-WordPress-on-Azure-App-Service.html">&lt;p&gt;We are thrilled to announce that WordPress on App Service that was under public preview since February 15, 2022, is now generally available. With advanced features and revised hosting plans, you can now deploy and manage WordPress websites with ease. We have continued to make improvements in performance and security so that you can deliver a great experience to your customers.&lt;/p&gt;
+
+&lt;p&gt;We recommend that you use Linux for your WordPress server. PHP on Windows will not be officially supported on App Service Platform after November 25, 2022.&lt;/p&gt;
+
+&lt;p&gt;Read the full announcement at &lt;a href=&quot;https://techcommunity.microsoft.com/t5/apps-on-azure-blog/announcing-the-general-availability-of-wordpress-on-azure-app/ba-p/3593481&quot;&gt;Announcing the General Availability of WordPress on Azure App Service - Microsoft Tech Community&lt;/a&gt;.&lt;/p&gt;
+
+&lt;p&gt;You can go ahead and start creating a WordPress website at &lt;a href=&quot;https://ms.portal.azure.com/#create/WordPress.WordPress&quot;&gt;Create WordPress on App Service - Microsoft Azure&lt;/a&gt; or go to &lt;a href=&quot;https://docs.microsoft.com/en-us/azure/app-service/quickstart-wordpress&quot;&gt;QuickStart: Create a WordPress site - Azure App Service | Microsoft Docs&lt;/a&gt; for a how-to guide to build your WordPress website in Azure App Service.&lt;/p&gt;</content><author><name>Azure App Service</name></author><category term="app service" /><category term="php" /><category term="wordpress" /><summary type="html">We are thrilled to announce that WordPress on App Service that was under public preview since February 15, 2022, is now generally available. With advanced features and revised hosting plans, you can now deploy and manage WordPress websites with ease. We have continued to make improvements in performance and security so that you can deliver a great experience to your customers.</summary></entry><entry><title type="html">.NET 7 Preview 5 available on App Service</title><link href="https://azure.github.io/AppService/2022/07/18/dotnet7_preview5.html" rel="alternate" type="text/html" title=".NET 7 Preview 5 available on App Service" /><published>2022-07-18T00:00:00+00:00</published><updated>2022-07-18T00:00:00+00:00</updated><id>https://azure.github.io/AppService/2022/07/18/dotnet7_preview5</id><content type="html" xml:base="https://azure.github.io/AppService/2022/07/18/dotnet7_preview5.html">&lt;p&gt;We are happy to announce that App Service now supports apps targeting &lt;a href=&quot;https://dotnet.microsoft.com/download/dotnet/7.0&quot;&gt;.NET 7 Preview 5&lt;/a&gt; across all public regions on both Windows and Linux App Service Plans through the &lt;a href=&quot;https://aka.ms/app-service-early-access&quot;&gt;App Service Early Access feature&lt;/a&gt;.&lt;/p&gt;
+
+&lt;p&gt;&lt;a href=&quot;https://go.microsoft.com/fwlink/?linkid=2201098&quot;&gt;Azure Functions&lt;/a&gt; has also added initial support for .NET 7 Preview 5.&lt;/p&gt;
+
+&lt;p&gt;Any app targeting the .NET 7 on App Service during the preview stages will be automatically updated to the latest .NET 7 Preview release as newer releases become available. This update process will continue all the way up to the RC and GA releases.&lt;/p&gt;
+
+&lt;p&gt;Self-contained .NET apps will &lt;em&gt;not&lt;/em&gt; be auto-updated since they have no dependency on the runtime provided by App Service.&lt;/p&gt;
+
+&lt;p&gt;Want to get started with .NET 7? Follow these guides:&lt;/p&gt;
+
+&lt;ol&gt;
+  &lt;li&gt;&lt;a href=&quot;https://dotnet.microsoft.com/download/dotnet/7.0&quot;&gt;Download .NET 7&lt;/a&gt;&lt;/li&gt;
+  &lt;li&gt;&lt;a href=&quot;https://www.c-sharpcorner.com/article/getting-started-with-net-7-0/&quot;&gt;Get Started with .NET 7 and Visual Studio&lt;/a&gt;&lt;/li&gt;
+  &lt;li&gt;&lt;a href=&quot;https://docs.microsoft.com/azure/app-service/quickstart-dotnetcore?tabs=net60&amp;amp;pivots=development-environment-vs&quot;&gt;Deploy a .NET application to App Service&lt;/a&gt;&lt;/li&gt;
+&lt;/ol&gt;</content><author><name>Azure App Service</name></author><summary type="html">We are happy to announce that App Service now supports apps targeting .NET 7 Preview 5 across all public regions on both Windows and Linux App Service Plans through the App Service Early Access feature.</summary></entry><entry><title type="html">Azure Policy Updates for App Service</title><link href="https://azure.github.io/AppService/2022/07/06/azure-policy-updates-for-app-service.html" rel="alternate" type="text/html" title="Azure Policy Updates for App Service" /><published>2022-07-06T00:00:00+00:00</published><updated>2022-07-06T00:00:00+00:00</updated><id>https://azure.github.io/AppService/2022/07/06/azure-policy-updates-for-app-service</id><content type="html" xml:base="https://azure.github.io/AppService/2022/07/06/azure-policy-updates-for-app-service.html">&lt;p&gt;&lt;a href=&quot;https://docs.microsoft.com/azure/governance/policy/concepts/regulatory-compliance&quot;&gt;Regulatory Compliance in Azure Policy&lt;/a&gt; provides Microsoft created and managed initiative definitions, known as built-ins, for the compliance domains and security controls related to different compliance standards. A subset of those initiatives contains compliance domains and security controls specifically for Azure App Service. You can assign the built-in initiatives to verify your compliance status against common standards or you can assign the built-ins for a control individually to help make your Azure resources compliant with a specific standard. To see the built-in policies for App Service, see &lt;a href=&quot;https://docs.microsoft.com/azure/app-service/security-controls-policy&quot;&gt;Azure Policy Regulatory Compliance controls for Azure App Service&lt;/a&gt;. To learn more about applying and managing policies, see &lt;a href=&quot;https://docs.microsoft.com/azure/governance/policy/tutorials/create-and-manage&quot;&gt;Tutorial: Create and manage policies to enforce compliance&lt;/a&gt;.&lt;/p&gt;
+
+&lt;h2 id=&quot;latest-updates&quot;&gt;Latest updates&lt;/h2&gt;
+
+&lt;p&gt;The App Service team recently underwent an effort to clean-up the App Service built-in policies. This effort included the following updates:&lt;/p&gt;
+
+&lt;ul&gt;
+  &lt;li&gt;Deprecation of policies that no longer require dedicated policy definitions to simplify overall management of policy inventory.&lt;/li&gt;
+  &lt;li&gt;Rename of policies to follow a standard naming convention. The naming convention is as follows:
+    &lt;ul&gt;
+      &lt;li&gt;Lead with the affected service, resource type, or feature.&lt;/li&gt;
+      &lt;li&gt;Include “should” to explain the unsecured element (“[A] should [B]”).&lt;/li&gt;
+      &lt;li&gt;For example, a policy name that follows the naming convention would be “App Service apps should only be accessible over HTTPS”.&lt;/li&gt;
+    &lt;/ul&gt;
+  &lt;/li&gt;
+  &lt;li&gt;Removal of Logic Apps from the scope of all App Service policy definitions.
+    &lt;ul&gt;
+      &lt;li&gt;Logic Apps have their own dedicated policies.&lt;/li&gt;
+    &lt;/ul&gt;
+  &lt;/li&gt;
+  &lt;li&gt;Re-scope of policies to clearly distinguish Function app policies from App Service policies.
+    &lt;ul&gt;
+      &lt;li&gt;All Function app policies now include the condition &lt;code class=&quot;highlighter-rouge&quot;&gt;{&quot;field&quot;: &quot;kind&quot;, &quot;contains&quot;: &quot;functionapp&quot;}&lt;/code&gt;.&lt;/li&gt;
+      &lt;li&gt;All App Service policies now include the condition &lt;code class=&quot;highlighter-rouge&quot;&gt;{&quot;field&quot;: &quot;kind&quot;, &quot;notContains&quot;: &quot;functionapp&quot;}&lt;/code&gt; which scopes them to include all app types except Function apps and Logic Apps.&lt;/li&gt;
+      &lt;li&gt;For more information on policy conditions, see &lt;a href=&quot;https://docs.microsoft.com/azure/governance/policy/concepts/definition-structure#conditions&quot;&gt;Azure Policy definition structure&lt;/a&gt;.&lt;/li&gt;
+    &lt;/ul&gt;
+  &lt;/li&gt;
+  &lt;li&gt;Addition of App Service slots in policy’s scope where applicable.&lt;/li&gt;
+&lt;/ul&gt;
+
+&lt;p&gt;For the full list of detailed updates, see the &lt;a href=&quot;https://docs.microsoft.com/azure/app-service/security-controls-policy#release-notes&quot;&gt;release notes&lt;/a&gt;.&lt;/p&gt;
+
+&lt;h2 id=&quot;action-needed&quot;&gt;Action needed&lt;/h2&gt;
+
+&lt;p&gt;There’s no action required if you already have the updated policies assigned to your resources. The policies updates will automatically be applied. Be sure to review your new overall compliance status as the scope of some of the policies has been modified, which means additional resources may now be in scope for policy evaluation.&lt;/p&gt;
+
+&lt;p&gt;Deprecated policies will no longer show up in the definitions list in the Azure portal. They’ll still be available via APIs. They’ll also still be evaluated if individually assigned. You won’t receive a notification that these policies have been deprecated however you’ll see that their display names have changed to be prefixed with “[Deprecated]”. If you no longer want these policies to be evaluated, you can unassign them. If you’ve assigned any of the initiatives which include these policies, they’ll automatically be removed from the initiative and will no longer be evaluated.&lt;/p&gt;
+
+&lt;p&gt;If you use the specific policy display names in any reporting, upstream metrics, or alerting mechanisms, you’ll need to update these values to the latest versions. Policy display name changes can be found in the &lt;a href=&quot;https://docs.microsoft.com/azure/app-service/security-controls-policy#release-notes&quot;&gt;release notes&lt;/a&gt;.&lt;/p&gt;
+
+&lt;h2 id=&quot;whats-next&quot;&gt;What’s next?&lt;/h2&gt;
+
+&lt;p&gt;The clean-up effort is ongoing. The &lt;a href=&quot;https://docs.microsoft.com/azure/app-service/security-controls-policy#release-notes&quot;&gt;release notes&lt;/a&gt; will continue to be updated as changes are rolled out.&lt;/p&gt;
+
+&lt;p&gt;We are continuously assessing the App Service policy inventory to ensure our built-in list includes policies that meet the latest security best practices and recommendations. We’ll also continue to add new policies to keep up with the latest App Service features.&lt;/p&gt;</content><author><name>Azure App Service</name></author><summary type="html">Regulatory Compliance in Azure Policy provides Microsoft created and managed initiative definitions, known as built-ins, for the compliance domains and security controls related to different compliance standards. A subset of those initiatives contains compliance domains and security controls specifically for Azure App Service. You can assign the built-in initiatives to verify your compliance status against common standards or you can assign the built-ins for a control individually to help make your Azure resources compliant with a specific standard. To see the built-in policies for App Service, see Azure Policy Regulatory Compliance controls for Azure App Service. To learn more about applying and managing policies, see Tutorial: Create and manage policies to enforce compliance.</summary></entry><entry><title type="html">Announcing Resiliency Score Report for Azure Web Apps</title><link href="https://azure.github.io/AppService/2022/06/16/Announcing-Resiliency-Score-Report-for-Azure-Web-Apps.html" rel="alternate" type="text/html" title="Announcing Resiliency Score Report for Azure Web Apps" /><published>2022-06-16T00:00:00+00:00</published><updated>2022-06-16T00:00:00+00:00</updated><id>https://azure.github.io/AppService/2022/06/16/Announcing-Resiliency-Score-Report-for-Azure-Web-Apps</id><content type="html" xml:base="https://azure.github.io/AppService/2022/06/16/Announcing-Resiliency-Score-Report-for-Azure-Web-Apps.html">&lt;p class=&quot;text-justify&quot;&gt;Resiliency Score report is a downloadable report that checks whether your Azure Web App is implementing the best practices to make it less susceptible to availability issues.&lt;/p&gt;
+
+&lt;p class=&quot;text-justify&quot;&gt;The report doesn’t review your Web App’s code, instead it focuses on the recommended settings and the features available to make your App Service more resilient to failures.&lt;/p&gt;
+
+&lt;p class=&quot;text-justify&quot;&gt;Currently, it’s only available for Web App (Windows) running on Standard plans or higher. More products will be included in the future.&lt;/p&gt;
+
+&lt;h2 id=&quot;accessing-the-report&quot;&gt;Accessing the report&lt;/h2&gt;
+
+&lt;p&gt;You can access the report through the Diagnose and solve problems blade of your Azure App Service:&lt;/p&gt;
+
+&lt;ol&gt;
+  &lt;li&gt;In the &lt;a href=&quot;https://portal.azure.com/&quot;&gt;&lt;strong&gt;Azure Portal&lt;/strong&gt;&lt;/a&gt;, click on &lt;strong&gt;App Services&lt;/strong&gt;&lt;/li&gt;
+  &lt;li&gt;Click on any Web App (Windows) running in a Standard app service plan or higher&lt;/li&gt;
+  &lt;li&gt;Click on &lt;strong&gt;Diagnose and solve problems&lt;/strong&gt;&lt;/li&gt;
+  &lt;li&gt;Click on any of the &lt;strong&gt;Troubleshooting categories&lt;/strong&gt;. For these instructions we’ll use &lt;strong&gt;Availability and Performance&lt;/strong&gt;&lt;/li&gt;
+  &lt;li&gt;In &lt;strong&gt;Availability and Performance&lt;/strong&gt; look for the command bar in the center and towards the top of the blade. Then, click on the &lt;img src=&quot;/AppService/media/2022/06/ResiliencyScoreReport-Button.png&quot; alt=&quot;Get the Resiliency Score&quot; title=&quot;Get the Resiliency Score&quot; /&gt; button. This will generate the report and download it after a few seconds.&lt;/li&gt;
+&lt;/ol&gt;
+
+&lt;h2 id=&quot;report-structure&quot;&gt;Report structure&lt;/h2&gt;
+
+&lt;p&gt;The report is structured in 3 main sections:&lt;/p&gt;
+
+&lt;h3 id=&quot;resiliency-score&quot;&gt;Resiliency Score&lt;/h3&gt;
+
+&lt;p class=&quot;text-justify&quot;&gt;The score is a number between 0 and 100, where less than 59, means the Web App is rated as poor and more than 80 is rated as excellent. Each feature has different weights, so each will have a different impact on your score.
+A score of 100% doesn’t mean that the Web App will never be down, but rather that it has implemented 100% of our resiliency best practices.&lt;/p&gt;
+
+&lt;p&gt;&lt;img src=&quot;/AppService/media/2022/06/ResiliencyScoreReport-Score.png&quot; alt=&quot;Resiliency Score&quot; class=&quot;align-center&quot; /&gt;&lt;/p&gt;
+
+&lt;h3 id=&quot;contributing-factors-table&quot;&gt;Contributing factors table&lt;/h3&gt;
+
+&lt;p class=&quot;text-justify&quot;&gt;This is a general overview of all the features and how well they have been implemented. If the feature is implemented but there are improvements that can be done, it will be marked as “Partially implemented”.
+This table also works as a Table of contents of sorts, as it has links to jump to the details on each feature.&lt;/p&gt;
+
+&lt;p&gt;&lt;img src=&quot;/AppService/media/2022/06/ResiliencyScoreReport-ContributingFactors.png&quot; alt=&quot;Resiliency Score&quot; class=&quot;align-center&quot; /&gt;&lt;/p&gt;
+
+&lt;h3 id=&quot;detailed-scores-and-instructions&quot;&gt;Detailed scores and instructions&lt;/h3&gt;
+
+&lt;p&gt;This section intends to explain why this feature is important for you, the current state and provide details on how to implement it.
+Each feature is divided in the following 4 sections:&lt;/p&gt;
+
+&lt;h4 id=&quot;description&quot;&gt;Description&lt;/h4&gt;
+
+&lt;p&gt;This is an explanation of why this feature is necessary.&lt;/p&gt;
+
+&lt;p&gt;&lt;img src=&quot;/AppService/media/2022/06/ResiliencyScoreReport-Details-and-instructions-Description.png&quot; alt=&quot;Resiliency Score&quot; class=&quot;align-center&quot; /&gt;&lt;/p&gt;
+
+&lt;h4 id=&quot;status-of-verified-web-apps&quot;&gt;Status of verified Web Apps&lt;/h4&gt;
+
+&lt;p&gt;This table includes the Grade (Fail, N/A (Not Applicable) or Pass) and Comments specific to the implementation of this feature.&lt;/p&gt;
+
+&lt;p&gt;&lt;img src=&quot;/AppService/media/2022/06/ResiliencyScoreReport-Details-and-instructions-Status.png&quot; alt=&quot;Resiliency Score&quot; class=&quot;align-center&quot; /&gt;&lt;/p&gt;
+
+&lt;h4 id=&quot;solution&quot;&gt;Solution&lt;/h4&gt;
+
+&lt;p&gt;In here you can find steps to implement the solution through the Azure Portal and when available, through PowerShell and/or Azure CLI.
+We include the steps even if the solution is implemented already, just in case you need them to implement it on other Web Apps.&lt;/p&gt;
+
+&lt;p&gt;&lt;img src=&quot;/AppService/media/2022/06/ResiliencyScoreReport-Details-and-instructions-Solution.png&quot; alt=&quot;Resiliency Score&quot; class=&quot;full&quot; /&gt;&lt;/p&gt;
+
+&lt;h4 id=&quot;more-information&quot;&gt;More information&lt;/h4&gt;
+
+&lt;p&gt;These are links to documents where you can find more details about this feature.&lt;/p&gt;
+
+&lt;p&gt;&lt;img src=&quot;/AppService/media/2022/06/ResiliencyScoreReport-Details-and-instructions-More_information.png&quot; alt=&quot;Resiliency Score&quot; class=&quot;align-center&quot; /&gt;&lt;/p&gt;
+
+&lt;h2 id=&quot;learn-more&quot;&gt;Learn More&lt;/h2&gt;
+
+&lt;ul&gt;
+  &lt;li&gt;&lt;a href=&quot;https://azure.github.io/AppService/2020/05/15/Robust-Apps-for-the-cloud.html#use-multiple-instances&quot; title=&quot;The Ultimate Guide to Running Healthy Apps in the Cloud&quot;&gt;The Ultimate Guide to Running Healthy Apps in the Cloud&lt;/a&gt;&lt;/li&gt;
+&lt;/ul&gt;
+
+&lt;h3 id=&quot;questionsfeedback&quot;&gt;Questions/Feedback&lt;/h3&gt;
+
+&lt;p&gt;If you have any questions or feedback, please reach out to our team at &lt;a href=&quot;mailto:diagnostics@microsoft.com&quot;&gt;diagnostics@microsoft.com&lt;/a&gt;&lt;/p&gt;</content><author><name>Azure App Service</name></author><category term="Diagnostics" /><summary type="html">Resiliency Score report is a downloadable report that checks whether your Azure Web App is implementing the best practices to make it less susceptible to availability issues.</summary></entry><entry><title type="html">Intro to Microsoft Defender for App Service</title><link href="https://azure.github.io/AppService/2022/06/16/Into-to-microsoft-defender-for-app-service.html" rel="alternate" type="text/html" title="Intro to Microsoft Defender for App Service" /><published>2022-06-16T00:00:00+00:00</published><updated>2022-06-16T00:00:00+00:00</updated><id>https://azure.github.io/AppService/2022/06/16/Into-to-microsoft-defender-for-app-service</id><content type="html" xml:base="https://azure.github.io/AppService/2022/06/16/Into-to-microsoft-defender-for-app-service.html">&lt;p&gt;If you’re an Azure portal user with App Service, you’ve most likely seen the &lt;strong&gt;Security&lt;/strong&gt; item in the left-hand menu. This item comes from our partners from the recently re-branded &lt;a href=&quot;https://docs.microsoft.com/azure/defender-for-cloud/defender-for-cloud-introduction&quot;&gt;Microsoft Defender for Cloud&lt;/a&gt;. If you aren’t familiar with Microsoft Defender for Cloud (formerly Azure Security Center and Azure Defender), it’s a tool for security posture management and threat protection. It aggregates compliance data and continually assesses your environments to give you a summary view of your security posture and allow you to streamline security management not just for your resources in Azure, but also for your resources and environments on-premises as well as in other cloud platforms (Defender for Cloud currently supports integration with AWS and GCP). For more information about Microsoft Defender for Cloud, check out the &lt;a href=&quot;https://docs.microsoft.com/azure/defender-for-cloud/defender-for-cloud-introduction&quot;&gt;documentation&lt;/a&gt;.&lt;/p&gt;
+
+&lt;p&gt;&lt;img src=&quot;/AppService/media/2022/04/AppServiceSecurityBlade.png&quot; alt=&quot;App Service Security blade&quot; /&gt;&lt;/p&gt;
+
+&lt;h2 id=&quot;microsoft-defender-for-app-service&quot;&gt;Microsoft Defender for App Service&lt;/h2&gt;
+
+&lt;h3 id=&quot;without-enhanced-security-features-free&quot;&gt;Without enhanced security features (Free)&lt;/h3&gt;
+
+&lt;p&gt;Microsoft Defender for Cloud is offered in two modes. Without enhanced security features (Free) is enabled for free on all your Azure subscriptions when you visit the workload protection dashboard in the Azure portal for the first time, or if enabled programmatically via API. The free version will not be enabled until you complete one of those actions. Using the free mode provides the secure score and its related features: security policy, continuous security assessment, and actionable security recommendations to help you protect your Azure resources. The below screenshot is a sample of what the free version gives you. As you can see on the left-hand side, there are a number of features that aren’t selectable since they aren’t available with the free version. However, even though they are not selectable from the TOC, you can access the Regulatory Compliance and Inventory blades by clicking on the respective widgets in the dashboard.&lt;/p&gt;
+
+&lt;p&gt;&lt;img src=&quot;/AppService/media/2022/04/DefenderFreeMode.png&quot; alt=&quot;Defender for Cloud without enhanced security features&quot; /&gt;&lt;/p&gt;
+
+&lt;p&gt;The free mode gives you access to your compliance status based on the &lt;a href=&quot;https://docs.microsoft.com/security/benchmark/azure/&quot;&gt;Azure Security Benchmark&lt;/a&gt;. For example, the Azure Security Baseline states that &lt;a href=&quot;https://docs.microsoft.com/security/benchmark/azure/security-controls-v3-data-protection#dp-3-encrypt-sensitive-data-in-transit&quot;&gt;sensitive data should be encrypted in transit&lt;/a&gt;. The below screenshot shows where this control, specifically for App Service, shows up in the Defender for Cloud compliance dashboard. The Azure Security Baseline includes standards for services other than App Service as well to give you full compliance status of your account. To track compliance with other standards, you’ll need to enable the enhanced security features.&lt;/p&gt;
+
+&lt;p&gt;&lt;img src=&quot;/AppService/media/2022/04/DefenderFreeModeComplianceSample.png&quot; alt=&quot;Defender for Cloud compliance sample&quot; /&gt;&lt;/p&gt;
+
+&lt;p&gt;From the compliance dashboard in Defender, you’ll see exactly which benchmarks your environment fails to meet. Selecting one of the controls will show you which resources are failing the compliance check as well as in many cases give you a “Quick Fix” to make your resources compliant.&lt;/p&gt;
+
+&lt;p&gt;Heading back to the &lt;strong&gt;Security&lt;/strong&gt; blade for your App Service, after enabling Defender, and therefore the Azure Security Benchmark, under Recommendations, you’ll now see the App Service specific controls from the Azure Security Benchmark where your app fails to be compliant. If you don’t see any recommendations, your app is either fully compliant with the Azure Security Benchmark or you haven’t given the platform enough time to complete its assessment and update the portal (this can take up to 24 hours). You’ll additionally see a severity recommendation for each control based on the priority the Azure Security Benchmark, which gives you a good sense of which controls you should most likely enable. Note that if you have enabled any custom policies in Azure Policy based off of the controls associated with the Azure Security Benchmark, they won’t show up in the Recommendations or in the Defender compliance dashboard. At this time, only “built-in” policies are supported. Additionally, you won’t see any alerts under “Security incidents and alerts” in the Security blade since that is a not a feature of the free version.&lt;/p&gt;
+
+&lt;p&gt;&lt;img src=&quot;/AppService/media/2022/04/AppServiceSecurityBladeFull.png&quot; alt=&quot;App Service Security blade sample&quot; /&gt;&lt;/p&gt;
+
+&lt;h3 id=&quot;with-enhanced-security-features&quot;&gt;With enhanced security features&lt;/h3&gt;
+
+&lt;p&gt;Defender for Cloud with all enhanced security features extends the capabilities of the free mode and allows you to include workloads running in private and other public clouds, providing unified security management and threat protection across your hybrid cloud workloads. For more information on the two modes, see the &lt;a href=&quot;https://docs.microsoft.com/azure/defender-for-cloud/enhanced-security-features-overview&quot;&gt;enhanced security features documentation&lt;/a&gt;.&lt;/p&gt;
+
+&lt;p&gt;If you choose to use the enhanced security features, Defender for Cloud offers specific plans dedicated to various Azure services including one for App Service called &lt;a href=&quot;https://docs.microsoft.com/azure/defender-for-cloud/defender-for-app-service-introduction&quot;&gt;Microsoft Defender for App Service&lt;/a&gt;. In addition to the benefits you get from the enhanced security features, enabling Defender for App Service increases your security posture by assessing the resources covered by your App Service plan and generating security recommendations based on its findings. It also monitors the underlying logs and infrastructure that customers don’t typically have access to since App Service is a fully managed platform. To learn more about the benefits of Defender for App Service, see &lt;a href=&quot;https://docs.microsoft.com/azure/defender-for-cloud/defender-for-app-service-introduction&quot;&gt;protecting your web apps and APIs&lt;/a&gt;.&lt;/p&gt;
+
+&lt;h2 id=&quot;things-to-consider&quot;&gt;Things to consider&lt;/h2&gt;
+
+&lt;p&gt;If the built-in policies that make up the Azure Security Benchmark and other compliance standards don’t meet your compliance standards, you can &lt;a href=&quot;https://docs.microsoft.com/azure/governance/policy/tutorials/create-custom-policy-definition&quot;&gt;create custom policies in Azure Policy&lt;/a&gt;. Custom policies however will not show up under the recommendations in the Security blade and in your Defender compliance dashboard.&lt;/p&gt;
+
+&lt;p&gt;You must visit the Microsoft Defender for Cloud dashboard in the portal or enable Defender programmatically via API for it to start monitoring your resources. Even if you are just using the free version, you still need complete one of those actions to see your recommendations in the Security blade.&lt;/p&gt;
+
+&lt;p&gt;Defender for App Service costs $15/month per instance. If cost is a limiting factor for you, take this into consideration when enabling the enhanced security features. Defender gives you the ability to select which resources you want to be in scope and therefore charged for, which can help you reduce costs as needed. If you don’t enable Defender for App Service, you can still use the free version and have access to compliance against the Azure Security Benchmark.&lt;/p&gt;
+
+&lt;p&gt;If you choose to not enable the enhanced security features, that doesn’t mean your App Service isn’t secure or that you don’t have options to secure your apps. App Service as well as Azure have a number of built-in features and services that you can leverage to lock down and protect your apps based on your requirements. To learn more about App Service security, start with the &lt;a href=&quot;https://docs.microsoft.com/azure/app-service/security-recommendations&quot;&gt;security recommendations for App Service&lt;/a&gt;.&lt;/p&gt;</content><author><name>Azure App Service</name></author><summary type="html">If you’re an Azure portal user with App Service, you’ve most likely seen the Security item in the left-hand menu. This item comes from our partners from the recently re-branded Microsoft Defender for Cloud. If you aren’t familiar with Microsoft Defender for Cloud (formerly Azure Security Center and Azure Defender), it’s a tool for security posture management and threat protection. It aggregates compliance data and continually assesses your environments to give you a summary view of your security posture and allow you to streamline security management not just for your resources in Azure, but also for your resources and environments on-premises as well as in other cloud platforms (Defender for Cloud currently supports integration with AWS and GCP). For more information about Microsoft Defender for Cloud, check out the documentation.</summary></entry><entry><title type="html">Scala on App Service</title><link href="https://azure.github.io/AppService/2022/05/31/scala-on-app-service.html" rel="alternate" type="text/html" title="Scala on App Service" /><published>2022-05-31T00:00:00+00:00</published><updated>2022-05-31T00:00:00+00:00</updated><id>https://azure.github.io/AppService/2022/05/31/scala-on-app-service</id><content type="html" xml:base="https://azure.github.io/AppService/2022/05/31/scala-on-app-service.html">&lt;p&gt;Scala is an object-oriented programming language that can be compiled to run on the Java Virtual Machine (JVM). Using the Java runtime allows you to integrate with the enormous Java ecosystem and execute Scala programs anywhere the JVM is available. This includes Azure App Service with the Java SE runtime. The &lt;a href=&quot;https://www.playframework.com/&quot;&gt;Play Framework&lt;/a&gt; is a lightweight web application framework for Java and Scala that integrates all components and APIs needed for modern web application development.&lt;/p&gt;
+
+&lt;p&gt;Follow the tutorial below to deploy a Play framework Scala app onto Azure App Service.&lt;/p&gt;
+
+&lt;h2 id=&quot;prerequisites&quot;&gt;Prerequisites&lt;/h2&gt;
+
+&lt;p&gt;To follow the steps in this tutorial you will need the following tools installed locally. (You can use &lt;em&gt;either&lt;/em&gt; the Azure CLI &lt;em&gt;or&lt;/em&gt; the Maven plugin. You don’t need both to complete this tutorial.)&lt;/p&gt;
+
+&lt;ul&gt;
+  &lt;li&gt;&lt;a href=&quot;https://docs.microsoft.com/en-us/java/openjdk/download#openjdk-11&quot;&gt;Java 11&lt;/a&gt;&lt;/li&gt;
+  &lt;li&gt;&lt;a href=&quot;http://www.scala-sbt.org/download.html&quot;&gt;sbt v1.3.4 or greater&lt;/a&gt;&lt;/li&gt;
+  &lt;li&gt;&lt;a href=&quot;https://maven.apache.org/install.html&quot;&gt;Maven&lt;/a&gt; (Or install the Azure CLI)&lt;/li&gt;
+  &lt;li&gt;&lt;a href=&quot;https://docs.microsoft.com/en-us/cli/azure/install-azure-cli&quot;&gt;Azure CLI&lt;/a&gt; (Or use Maven)&lt;/li&gt;
+&lt;/ul&gt;
+
+&lt;p&gt;To check your sbt version, enter the following in a command window:&lt;/p&gt;
+
+&lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;sbt sbtVersion
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;h2 id=&quot;build-and-run-the-project&quot;&gt;Build and Run the Project&lt;/h2&gt;
+
+&lt;p&gt;This example Play project was created from a &lt;a href=&quot;https://github.com/playframework/play-samples/tree/2.8.x/play-scala-hello-world-tutorial&quot;&gt;seed template&lt;/a&gt;. It includes all Play components and an Akka HTTP server. The project is also configured with filters for Cross-Site Request Forgery (CSRF) protection and security headers.&lt;/p&gt;
+
+&lt;p&gt;To build and run the project:&lt;/p&gt;
+
+&lt;ol&gt;
+  &lt;li&gt;
+    &lt;p&gt;First clone the &lt;a href=&quot;https://github.com/Azure-Samples/scala-on-app-service&quot;&gt;Scala on App Service&lt;/a&gt; repository with the following command: &lt;code class=&quot;highlighter-rouge&quot;&gt;git clone https://github.com/Azure-Samples/scala-on-app-service&lt;/code&gt;&lt;/p&gt;
+  &lt;/li&gt;
+  &lt;li&gt;
+    &lt;p&gt;Change directory into the example project directory: &lt;code class=&quot;highlighter-rouge&quot;&gt;cd scala-on-app-service&lt;/code&gt;&lt;/p&gt;
+  &lt;/li&gt;
+  &lt;li&gt;
+    &lt;p&gt;Build the project by running &lt;code class=&quot;highlighter-rouge&quot;&gt;sbt run&lt;/code&gt;. The command builds and starts the embedded HTTP server. Since this downloads libraries and dependencies, the amount of time required depends partly on your internet connection speed.&lt;/p&gt;
+  &lt;/li&gt;
+  &lt;li&gt;
+    &lt;p&gt;After the message &lt;code class=&quot;highlighter-rouge&quot;&gt;Server started, ...&lt;/code&gt; displays, enter the following URL in a browser: &lt;a href=&quot;http://localhost:9000&quot;&gt;http://localhost:9000&lt;/a&gt;. The Play application will respond with: &lt;code class=&quot;highlighter-rouge&quot;&gt;Welcome to the Hello World Scala POC Tutorial!&lt;/code&gt;.&lt;/p&gt;
+  &lt;/li&gt;
+&lt;/ol&gt;
+
+&lt;p&gt;Now that the application is working locally, let’s package the application into an executable .jar file that we can deploy onto Azure App Service.&lt;/p&gt;
+
+&lt;h2 id=&quot;assemble-and-test-jar-locally&quot;&gt;Assemble and Test JAR Locally&lt;/h2&gt;
+
+&lt;p&gt;Follow these steps to build a .jar file executable for a Java 11 runtime using sbt assembly.&lt;/p&gt;
+
+&lt;ol&gt;
+  &lt;li&gt;
+    &lt;p&gt;From the project root, run:&lt;/p&gt;
+
+    &lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; sbt assembly
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;    &lt;/div&gt;
+
+    &lt;p&gt;This command produces an executable .jar file in the &lt;code class=&quot;highlighter-rouge&quot;&gt;scala-on-app-service/target/scala-2.14/&lt;/code&gt; directory.&lt;/p&gt;
+  &lt;/li&gt;
+  &lt;li&gt;
+    &lt;p&gt;To test the app locally, run the previously created .jar file:&lt;/p&gt;
+
+    &lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; java &lt;span class=&quot;nt&quot;&gt;-jar&lt;/span&gt; target/scala-2.13/scala-play-example-assembly-1.0.jar
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;    &lt;/div&gt;
+
+    &lt;p&gt;The application should now be running at &lt;a href=&quot;http://localhost:80&quot;&gt;http://localhost:80&lt;/a&gt;. (Note that the port is now 80, as this is the default HTTP port expected on App Service when we deploy it in the next section.)&lt;/p&gt;
+  &lt;/li&gt;
+  &lt;li&gt;
+    &lt;p&gt;Open the application in your browser to ensure it works locally as an executable .jar.&lt;/p&gt;
+  &lt;/li&gt;
+&lt;/ol&gt;
+
+&lt;p&gt;Something interesting to note about creating an executable .jar using &lt;code class=&quot;highlighter-rouge&quot;&gt;sbt assembly&lt;/code&gt; is that it will inject all necessary Scala dependencies according to the &lt;code class=&quot;highlighter-rouge&quot;&gt;assemblyMergeStrategy&lt;/code&gt; defined in &lt;code class=&quot;highlighter-rouge&quot;&gt;build.sbt&lt;/code&gt;. This allows a native Scala app like this one to be executed in a Java-only environment. This also means that your production environment only needs to be running Java 11 and doesn’t need any Scala runtime dependencies since they’ve all been injected into the .jar file.&lt;/p&gt;
+
+&lt;h2 id=&quot;deploy-to-azure-app-service&quot;&gt;Deploy to Azure App Service&lt;/h2&gt;
+
+&lt;p&gt;You can deploy the .jar using either the Azure CLI or the Maven plugin. Follow the instructions below for your preferred tool.&lt;/p&gt;
+
+&lt;h3 id=&quot;deploy-as-jar-using-azure-cli&quot;&gt;Deploy as JAR using Azure CLI&lt;/h3&gt;
+
+&lt;p&gt;To deploy with the Azure CLI, run the following command from the project root:&lt;/p&gt;
+
+&lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;az webapp deploy &lt;span class=&quot;nt&quot;&gt;--type&lt;/span&gt; jar &lt;span class=&quot;nt&quot;&gt;--src-path&lt;/span&gt; target/scala-2.13/&amp;lt;project-name&amp;gt;-assembly-&amp;lt;version&amp;gt;.jar &lt;span class=&quot;nt&quot;&gt;--name&lt;/span&gt; &amp;lt;app-name&amp;gt; &lt;span class=&quot;nt&quot;&gt;--resource-group&lt;/span&gt; &amp;lt;resource-group&amp;gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;Once complete, you should be able to access your Play Framework app at &lt;code class=&quot;highlighter-rouge&quot;&gt;https://&amp;lt;app-name&amp;gt;.azurewebsites.net&lt;/code&gt;&lt;/p&gt;
+
+&lt;h3 id=&quot;deploy-as-jar-using-maven&quot;&gt;Deploy as JAR using Maven&lt;/h3&gt;
+
+&lt;ol&gt;
+  &lt;li&gt;
+    &lt;p&gt;To use Maven, you’ll need a pom file. The last line of &lt;code class=&quot;highlighter-rouge&quot;&gt;scala-on-app-service/build.sbt&lt;/code&gt; handles maven repo creation for publishing. After assembling your .jar file with &lt;code class=&quot;highlighter-rouge&quot;&gt;sbt assembly&lt;/code&gt;, run the following command from the project root to generate a pom file:&lt;/p&gt;
+
+    &lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; sbt publish
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;    &lt;/div&gt;
+  &lt;/li&gt;
+  &lt;li&gt;
+    &lt;p&gt;Copy the newly created pom file to the project root:&lt;/p&gt;
+
+    &lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; &lt;span class=&quot;nb&quot;&gt;cp &lt;/span&gt;maven-repo/com/example/scala-play-example_2.13/1.0/scala-play-example_2.13-1.0.pom pom.xml
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;    &lt;/div&gt;
+  &lt;/li&gt;
+  &lt;li&gt;
+    &lt;p&gt;Configure the webapp using the appropriate azure plugin for maven:&lt;/p&gt;
+
+    &lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; mvn com.microsoft.azure:azure-webapp-maven-plugin:2.5.0:config
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;    &lt;/div&gt;
+  &lt;/li&gt;
+  &lt;li&gt;
+    &lt;p&gt;Update the app name and .jar file location in the newly modified pom.xml, for example:&lt;/p&gt;
+
+    &lt;div class=&quot;language-xml highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; &lt;span class=&quot;nt&quot;&gt;&amp;lt;appName&amp;gt;&lt;/span&gt;Scala-App-Name&lt;span class=&quot;nt&quot;&gt;&amp;lt;/appName&amp;gt;&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;    &lt;/div&gt;
+
+    &lt;div class=&quot;language-xml highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; &lt;span class=&quot;nt&quot;&gt;&amp;lt;deployment&amp;gt;&lt;/span&gt;
+     &lt;span class=&quot;nt&quot;&gt;&amp;lt;resources&amp;gt;&lt;/span&gt;
+         &lt;span class=&quot;nt&quot;&gt;&amp;lt;resource&amp;gt;&lt;/span&gt;
+             &lt;span class=&quot;nt&quot;&gt;&amp;lt;directory&amp;gt;&lt;/span&gt;${project.basedir}/target/scala-2.13&lt;span class=&quot;nt&quot;&gt;&amp;lt;/directory&amp;gt;&lt;/span&gt;
+             &lt;span class=&quot;nt&quot;&gt;&amp;lt;includes&amp;gt;&lt;/span&gt;
+             &lt;span class=&quot;nt&quot;&gt;&amp;lt;include&amp;gt;&amp;lt;app-name&amp;gt;&lt;/span&gt;-assembly-1.0.jar&lt;span class=&quot;nt&quot;&gt;&amp;lt;/include&amp;gt;&lt;/span&gt;
+             &lt;span class=&quot;nt&quot;&gt;&amp;lt;/includes&amp;gt;&lt;/span&gt;
+         &lt;span class=&quot;nt&quot;&gt;&amp;lt;/resource&amp;gt;&lt;/span&gt;
+     &lt;span class=&quot;nt&quot;&gt;&amp;lt;/resources&amp;gt;&lt;/span&gt;
+ &lt;span class=&quot;nt&quot;&gt;&amp;lt;/deployment&amp;gt;&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;    &lt;/div&gt;
+  &lt;/li&gt;
+  &lt;li&gt;
+    &lt;p&gt;Deploy to App Service with the following command:&lt;/p&gt;
+
+    &lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; mvn azure-webapp:deploy
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;    &lt;/div&gt;
+  &lt;/li&gt;
+  &lt;li&gt;
+    &lt;p&gt;Update the application by running &lt;code class=&quot;highlighter-rouge&quot;&gt;sbt assembly&lt;/code&gt; followed by &lt;code class=&quot;highlighter-rouge&quot;&gt;mvn azure-webapp:deploy&lt;/code&gt; after making &amp;amp; testing changes locally.&lt;/p&gt;
+  &lt;/li&gt;
+&lt;/ol&gt;
+
+&lt;h2 id=&quot;resources&quot;&gt;Resources&lt;/h2&gt;
+
+&lt;ul&gt;
+  &lt;li&gt;&lt;a href=&quot;https://docs.microsoft.com/azure/app-service/configure-language-java&quot;&gt;Config Guide for Java on Azure App Service&lt;/a&gt;&lt;/li&gt;
+  &lt;li&gt;&lt;a href=&quot;https://www.playframework.com/documentation/2.8.x/SettingsAkkaHttp&quot;&gt;Akka Server Settings&lt;/a&gt;&lt;/li&gt;
+&lt;/ul&gt;</content><author><name>Azure App Service</name></author><category term="java" /><summary type="html">Build and run a Scala App on Azure App Service</summary></entry><entry><title type="html">gRPC support on Azure App Service</title><link href="https://azure.github.io/AppService/2022/05/23/gRPC-support-on-App-Service.html" rel="alternate" type="text/html" title="gRPC support on Azure App Service" /><published>2022-05-23T00:00:00+00:00</published><updated>2022-05-23T00:00:00+00:00</updated><id>https://azure.github.io/AppService/2022/05/23/gRPC-support-on-App-Service</id><content type="html" xml:base="https://azure.github.io/AppService/2022/05/23/gRPC-support-on-App-Service.html">&lt;p&gt;We are pleased to announce that gRPC is coming to Azure App Service for Linux workloads.&lt;/p&gt;
+
+&lt;p&gt;Using gRPC, you can utilize the remote procedure call framework to streamline messages between your client and server over HTTP/2. Using gRPC protocol over HTTP/2 enables the use of features like multiplexing to send multiple parallel requests over the same connection.&lt;/p&gt;
+
+&lt;p&gt;gRPC is currently available in EUAP with Private Preview for use with .NET Core 3.1 and .NET 6.&lt;/p&gt;
+
+&lt;p&gt;Please visit this tutorial &lt;a href=&quot;https://github.com/Azure/app-service-linux-docs/blob/master/HowTo/gRPC/use_gRPC_with_dotnet.md&quot;&gt;How-To deploy a .NET 6 gRPC app on App Service&lt;/a&gt; to try out gRPC on App Service today.&lt;/p&gt;</content><author><name>Azure App Service</name></author><category term="[&quot;gRPC&quot;]" /><summary type="html">We are pleased to announce that gRPC is coming to Azure App Service for Linux workloads.</summary></entry><entry><title type="html">Generally available: Enhanced network security features for App Service Basic SKU</title><link href="https://azure.github.io/AppService/2022/04/14/Enhanced-security-for-basic-sku.html" rel="alternate" type="text/html" title="Generally available: Enhanced network security features for App Service Basic SKU" /><published>2022-04-14T00:00:00+00:00</published><updated>2022-04-14T00:00:00+00:00</updated><id>https://azure.github.io/AppService/2022/04/14/Enhanced-security-for-basic-sku</id><content type="html" xml:base="https://azure.github.io/AppService/2022/04/14/Enhanced-security-for-basic-sku.html">&lt;p&gt;App Service now supports &lt;a href=&quot;https://docs.microsoft.com/azure/app-service/overview-vnet-integration&quot;&gt;VNet integration&lt;/a&gt; (outbound) and &lt;a href=&quot;https://docs.microsoft.com/azure/app-service/networking/private-endpoint&quot;&gt;private endpoints&lt;/a&gt; (inbound) all the way down to the &lt;a href=&quot;https://azure.microsoft.com/pricing/details/app-service/linux/&quot;&gt;Basic SKU&lt;/a&gt;. The App Service VNet integration feature enables your apps to access resources in or through a virtual network but doesn’t grant inbound private access to your apps. For inbound access, you need private endpoints, which allow clients located in your private network to securely access your apps over Private Link, which eliminates exposure from the public internet.&lt;/p&gt;
+
+&lt;p&gt;With this update, you can use our lower-cost tiers and achieve the same level of security that you could previously only achieve with our high-end SKUs. Note that if you want to downgrade an existing App Service Plan and still use VNet integration, you need to be on the newer App Service footprint to ensure you’re App Service Plan supports VNet integration for Basic SKU. For more details, see the VNet integration &lt;a href=&quot;https://docs.microsoft.com/azure/app-service/overview-vnet-integration#limitations&quot;&gt;limitations&lt;/a&gt;.&lt;/p&gt;
+
+&lt;p&gt;Learn how to enable &lt;a href=&quot;https://docs.microsoft.com/azure/app-service/configure-vnet-integration-enable&quot;&gt;virtual network integration&lt;/a&gt;.&lt;/p&gt;
+
+&lt;p&gt;Learn how to &lt;a href=&quot;https://docs.microsoft.com/azure/private-link/tutorial-private-endpoint-webapp-portal&quot;&gt;connect to a web app using an Azure Private endpoint&lt;/a&gt;.&lt;/p&gt;</content><author><name>Azure App Service</name></author><category term="networking" /><summary type="html">App Service now supports VNet integration (outbound) and private endpoints (inbound) all the way down to the Basic SKU. The App Service VNet integration feature enables your apps to access resources in or through a virtual network but doesn’t grant inbound private access to your apps. For inbound access, you need private endpoints, which allow clients located in your private network to securely access your apps over Private Link, which eliminates exposure from the public internet.</summary></entry></feed>
